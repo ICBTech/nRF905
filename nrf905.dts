@@ -1,0 +1,42 @@
+/*
+ * Device tree overlay for nrf905 on spi0.0
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2835", "brcm,bcm2836", "brcm,bcm2708", "brcm,bcm2709";
+    /* disable spi-dev for spi0.0 */
+    fragment@0 {
+        target = <&spi0>;
+        __overlay__ {
+            status = "okay";
+        };
+    };
+
+    fragment@1 {
+        target = <&spidev0>;
+        __overlay__ {
+            status = "disabled";
+        };
+    };
+
+    fragment@2 {
+        target = <&spi0>;
+        __overlay__ {
+            /* needed to avoid dtc warning */
+            #address-cells = <1>;
+            #size-cells = <0>;
+            nrf9050: nrf905@0 {
+                reg = <0>;
+                compatible = "nordic,nrf905";
+                spi-max-frequency = <10000000>;
+                pwr_up_gpio = <&gpio 17 1>;
+                trx_ce_gpio = <&gpio 27 1>;
+                tx_en_gpio = <&gpio 22 1>;
+                dr_gpio = <&gpio 18 1>;
+            };
+        };
+    };
+};
