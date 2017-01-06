@@ -131,7 +131,7 @@ If everything is correct, the output should be
 ### Clone this repository
 
 ```sh
-git clone git://this.repo
+git clone https://github.com/ICBTech/nRF905.git
 ```
 
 
