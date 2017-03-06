@@ -10,11 +10,19 @@
 #include <linux/interrupt.h>
 #include <linux/uaccess.h>
 #include <linux/of_gpio.h>
+#include <linux/poll.h>
 
 
 static struct class *nrf905_class = NULL;
 static struct device *nrf905_device = NULL;
 static int nrf905_major;
+
+struct buffer {
+    uint8_t (*data)[32];
+    int rpos;
+    int wpos;
+    size_t size;
+};
 
 struct nrf905_drvdata {
     dev_t devt;
@@ -26,6 +34,10 @@ struct nrf905_drvdata {
     int gpio_trx_ce;
     int gpio_tx_en;
     int gpio_dr;
+    wait_queue_head_t inq;
+    enum { NRF905_MODE_OFF, NRF905_MODE_RX, NRF905_MODE_TX } mode;
+    struct buffer buf;
+    int listen;
 };
 
 static LIST_HEAD(device_list);
@@ -138,6 +150,42 @@ static void nrf905_spi_r_rx_address(struct spi_device *spi, uint8_t *address, si
     for (i = 0; i < count; i++) {
         address[i] = nrf905_spi_r_config(spi, 5 + i);
     }
+}
+
+
+/* ************************************************************************** *
+ * Buffer functions                                                           *
+ * ************************************************************************** */
+
+
+static void nrf905_buf_write(struct buffer *buf, uint8_t *src)
+{
+    memcpy(buf->data[buf->wpos], src, 32);
+    if (++buf->wpos == buf->size)
+        buf->wpos = 0;
+}
+
+
+static void nrf905_buf_read(struct buffer *buf, uint8_t *dst)
+{
+    memcpy(dst, buf->data[buf->rpos], 32);
+    if (++buf->rpos == buf->size)
+        buf->rpos = 0;
+}
+
+
+static int nrf905_buf_readable(const struct buffer *buf)
+{
+    return buf->rpos != buf->wpos;
+}
+
+
+static int nrf905_buf_spacefree(const struct buffer *buf)
+{
+    if (buf->rpos == buf->wpos)
+        return buf->size - 1;
+    else
+        return ((buf->rpos + buf->size - buf->wpos) % buf->size) - 1;
 }
 
 
@@ -319,12 +367,55 @@ static ssize_t nrf905_attr_pa_pwr_read(struct device *dev, struct device_attribu
 static DEVICE_ATTR(pa_pwr, 0664, nrf905_attr_pa_pwr_read, nrf905_attr_pa_pwr_write);
 
 
+/** @brief Write handler for the listen sysfs attribute **/
+static ssize_t nrf905_attr_listen_write(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
+    struct nrf905_drvdata *drvdata = dev_get_drvdata(dev);
+
+    if (count != 1) {
+        return -EINVAL;
+    }
+
+    mutex_lock(&nrf905_cdev_lock);
+
+    // If changing from passive to listening, immediately set mode to RX
+    if (!drvdata->listen && *buf == '1') {
+        drvdata->listen = 1;
+        gpio_set_value(drvdata->gpio_trx_ce, 1);
+        drvdata->mode = NRF905_MODE_RX;
+    } else if (drvdata->listen && *buf == '0') {
+        drvdata->listen = 0;
+
+        // If changing from listening to passive, make sure that no readers are waiting
+        if (!waitqueue_active(&drvdata->inq)) {
+            gpio_set_value(drvdata->gpio_trx_ce, 0);
+            drvdata->mode = NRF905_MODE_OFF;
+        }
+    }
+    mutex_unlock(&nrf905_cdev_lock);
+
+    return count;
+}
+
+
+/** @brief Read handler for the listen sysfs attribute */
+static ssize_t nrf905_attr_listen_read(struct device *dev, struct device_attribute *attr, char *buf) {
+    struct nrf905_drvdata *drvdata = dev_get_drvdata(dev);
+
+    return sprintf(buf, "%d", drvdata->listen);
+}
+
+
+/** @brief Device attribute for configuring listening **/
+static DEVICE_ATTR(listen, 0664, nrf905_attr_listen_read, nrf905_attr_listen_write);
+
+
 /** @brief An array containing all the sysfs attributes */
 static struct attribute *nrf905_attributes[] = {
     &dev_attr_rx_address.attr,
     &dev_attr_tx_address.attr,
     &dev_attr_frequency.attr,
     &dev_attr_pa_pwr.attr,
+    &dev_attr_listen.attr,
     NULL,
 };
 
@@ -337,14 +428,41 @@ static struct attribute_group nrf905_attribute_group = {
 
 static irqreturn_t dr_irq(int irq, void *dev_id) {
     struct nrf905_drvdata *drvdata = dev_id;
+    uint8_t rxbuf[32];
 
     int value = gpio_get_value(drvdata->gpio_dr);
 
     if (value) {
-        wake_up_interruptible(&nrf905_cdev_wq);
+        if (drvdata->mode == NRF905_MODE_TX) {
+            wake_up_interruptible(&nrf905_cdev_wq);
+        } else {
+            mutex_lock(&nrf905_cdev_lock);
+            nrf905_spi_r_rx_payload(drvdata->spi, rxbuf, 32);
+            if (drvdata->mode == NRF905_MODE_RX && nrf905_buf_spacefree(&drvdata->buf)) {
+                nrf905_buf_write(&drvdata->buf, rxbuf);
+                mutex_unlock(&nrf905_cdev_lock);
+                wake_up_interruptible(&drvdata->inq);
+            } else {
+                mutex_unlock(&nrf905_cdev_lock);
+            }
+        }
     }
 
     return IRQ_HANDLED;
+}
+
+
+static unsigned int nrf905_cdev_poll(struct file *filp, poll_table *wait) {
+    struct nrf905_drvdata *drvdata = filp->private_data;
+    unsigned int mask = POLLOUT | POLLWRNORM;
+
+    mutex_lock(&nrf905_cdev_lock);
+    poll_wait(filp, &drvdata->inq, wait);
+    if (nrf905_buf_readable(&drvdata->buf))
+        mask |= POLLIN | POLLRDNORM;
+    mutex_unlock(&nrf905_cdev_lock);
+
+    return mask;
 }
 
 
@@ -359,20 +477,26 @@ static ssize_t nrf905_cdev_read(struct file *filp, char __user *buf, size_t coun
 
     mutex_lock(&nrf905_cdev_lock);
 
-    gpio_set_value(drvdata->gpio_tx_en, 0);
-    gpio_set_value(drvdata->gpio_trx_ce, 1);
-
-    if (wait_event_interruptible(nrf905_cdev_wq, gpio_get_value(drvdata->gpio_dr))) {
-        gpio_set_value(drvdata->gpio_trx_ce, 0);
-
-        mutex_unlock(&nrf905_cdev_lock);
-
-        return -ERESTARTSYS;
+    if (!drvdata->listen) {
+        gpio_set_value(drvdata->gpio_trx_ce, 1);
+        drvdata->mode = NRF905_MODE_RX;
     }
 
-    gpio_set_value(drvdata->gpio_trx_ce, 0);
+    while (!nrf905_buf_readable(&drvdata->buf)) {
+        mutex_unlock(&nrf905_cdev_lock);
+        if (filp->f_flags & O_NONBLOCK)
+            return -EAGAIN;
+        if (wait_event_interruptible(drvdata->inq, nrf905_buf_readable(&drvdata->buf)))
+            return -ERESTARTSYS;
+        mutex_lock(&nrf905_cdev_lock);
+    }
 
-    nrf905_spi_r_rx_payload(drvdata->spi, rxbuf, count);
+    nrf905_buf_read(&drvdata->buf, rxbuf);
+
+    if (!drvdata->listen) {
+        gpio_set_value(drvdata->gpio_trx_ce, 0);
+        drvdata->mode = NRF905_MODE_OFF;
+    }
 
     mutex_unlock(&nrf905_cdev_lock);
 
@@ -404,7 +528,10 @@ static ssize_t nrf905_cdev_write(struct file *filp, const char __user *buf, size
     nrf905_spi_w_tx_payload(drvdata->spi, txbuf, count - status);
 
     gpio_set_value(drvdata->gpio_tx_en, 1);
-    gpio_set_value(drvdata->gpio_trx_ce, 1);
+    if (drvdata->mode == NRF905_MODE_OFF) {
+        gpio_set_value(drvdata->gpio_trx_ce, 1);
+    }
+    drvdata->mode = NRF905_MODE_TX;
 
     if (wait_event_interruptible(nrf905_cdev_wq, gpio_get_value(drvdata->gpio_dr))) {
         gpio_set_value(drvdata->gpio_trx_ce, 0);
@@ -414,7 +541,13 @@ static ssize_t nrf905_cdev_write(struct file *filp, const char __user *buf, size
         return -ERESTARTSYS;
     }
 
-    gpio_set_value(drvdata->gpio_trx_ce, 0);
+    gpio_set_value(drvdata->gpio_tx_en, 0);
+    if (!drvdata->listen) {
+        gpio_set_value(drvdata->gpio_trx_ce, 0);
+        drvdata->mode = NRF905_MODE_OFF;
+    } else {
+        drvdata->mode = NRF905_MODE_RX;
+    }
 
     mutex_unlock(&nrf905_cdev_lock);
 
@@ -461,6 +594,12 @@ static int nrf905_cdev_release(struct inode *inode, struct file *filp) {
     filp->private_data = NULL;
 
     drvdata->users--;
+    if (!drvdata->listen) {
+        mutex_lock(&nrf905_cdev_lock);
+        gpio_set_value(drvdata->gpio_trx_ce, 0);
+        drvdata->mode = NRF905_MODE_OFF;
+        mutex_unlock(&nrf905_cdev_lock);
+    }
     if (!drvdata->users) {
         int dofree;
 
@@ -485,6 +624,7 @@ static struct file_operations nrf905_fops = {
     .read = nrf905_cdev_read,
     .open = nrf905_cdev_open,
     .release = nrf905_cdev_release,
+    .poll = nrf905_cdev_poll,
 };
 
 
@@ -496,6 +636,15 @@ static int nrf905_probe(struct spi_device *spi) {
 
     drvdata = kzalloc(sizeof(*drvdata), GFP_KERNEL);
     if (!drvdata) {
+        return -ENOMEM;
+    }
+
+    // Allocate read buffer
+    drvdata->buf.size = 32;
+    drvdata->buf.rpos = 0;
+    drvdata->buf.wpos = 0;
+    drvdata->buf.data = kzalloc(sizeof(uint8_t) * 32 * drvdata->buf.size, GFP_KERNEL);
+    if (!drvdata->buf.data) {
         return -ENOMEM;
     }
 
@@ -546,6 +695,14 @@ static int nrf905_probe(struct spi_device *spi) {
     msleep(10);
 
     gpio_set_value(drvdata->gpio_pwr_up, 1);
+
+    // Default to non-listening and off mode
+    gpio_set_value(drvdata->gpio_trx_ce, 0);
+    gpio_set_value(drvdata->gpio_tx_en, 0);
+    drvdata->listen = 0;
+    drvdata->mode = NRF905_MODE_OFF;
+
+    init_waitqueue_head(&drvdata->inq);
 
     // transition PWR_DWN -> ST_BY mode, i.e. wake up
     msleep(3);
